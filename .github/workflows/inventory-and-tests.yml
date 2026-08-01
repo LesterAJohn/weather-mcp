@@ -1,0 +1,98 @@
+name: Inventory and Tests
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    name: Generate Inventory
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Detect inventory script
+        id: inventory_script
+        shell: bash
+        run: |
+          INVENTORY_COMMAND="$(node -e "const pkg=require('./package.json'); const scripts=(pkg && pkg.scripts) || {}; process.stdout.write(scripts['inventory:generate'] || scripts.inventory || '');")"
+          echo "command=$INVENTORY_COMMAND" >> "$GITHUB_OUTPUT"
+
+      - name: Run inventory script
+        if: ${{ steps.inventory_script.outputs.command != '' }}
+        run: ${{ steps.inventory_script.outputs.command }}
+
+      - name: Upload OpenWeather endpoint inventory artifact
+        if: ${{ steps.inventory_script.outputs.command != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: openweather-endpoint-inventory
+          path: artifacts/openweather-onecall4-inventory.json
+          if-no-files-found: error
+
+      - name: Enforce committed inventory outputs
+        if: ${{ steps.inventory_script.outputs.command != '' }}
+        shell: bash
+        run: |
+          if ! git diff --quiet; then
+            echo "Inventory generation produced tracked file changes."
+            echo "Commit the generated inventory updates, then re-run CI."
+            git status --short
+            git diff --name-only
+            exit 1
+          fi
+
+      - name: Create repository inventory snapshot artifact
+        shell: bash
+        run: |
+          {
+            echo "Repository inventory generated on $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo
+            find . \
+              -path './.git' -prune -o \
+              -path './node_modules' -prune -o \
+              -type f -print
+          } | sed 's|^./||' | sort > "$RUNNER_TEMP/repository-inventory.txt"
+
+      - name: Upload repository inventory artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repository-inventory
+          path: ${{ runner.temp }}/repository-inventory.txt
+          if-no-files-found: error
+
+  tests:
+    name: Enforce Tests
+    runs-on: ubuntu-latest
+    needs: inventory
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test suite
+        run: npm run verify:prepush
