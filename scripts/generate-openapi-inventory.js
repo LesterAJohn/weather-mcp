@@ -8,6 +8,8 @@ const OUTPUT_FILE = `${OUTPUT_DIR}/openweather-onecall4-inventory.json`;
 
 async function main() {
   const artifact = buildEndpointInventoryArtifact();
+  // Keep the committed artifact deterministic so CI can enforce clean regeneration.
+  delete artifact.generatedAt;
   await mkdir(OUTPUT_DIR, { recursive: true });
   await writeFile(OUTPUT_FILE, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
   process.stdout.write(`${OUTPUT_FILE}\n`);
