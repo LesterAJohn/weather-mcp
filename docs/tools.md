@@ -225,6 +225,41 @@ All tools return:
 {"name":"weather_api_key_status","arguments":{"tenantId":"acme","userId":"sam"}}
 ```
 
+## weather_openweather_key_request_create
+- Use when: you need to track/request key acquisition workflow for a tenant/principal before key ingestion.
+- Do not use when: a scoped key is already configured and active.
+- Mode: Mutating.
+- Risk: Medium.
+- Required permissions: `authorizationKey` when `MCP_ADMIN_AUTH_KEY` exists.
+- Prerequisites: scope selection.
+- Environment behavior: stores request metadata at scoped Postgres config key `openweather.keyRequest`.
+- Parameters: `requester?`, `reason?`, `authorizationKey?` + scope.
+- Response shape: `{scope,key,request,nextStep}`.
+- Common failures: unauthorized (`401`), Postgres write failures.
+- Follow-up: `weather_openweather_key_request_status`, `weather_api_key_upsert`.
+- Safety warning: this does not create OpenWeather key automatically; it tracks workflow state only.
+- Example:
+```json
+{"name":"weather_openweather_key_request_create","arguments":{"tenantId":"acme","userId":"sam","reason":"tenant onboarding","authorizationKey":"<admin>"}}
+```
+
+## weather_openweather_key_request_status
+- Use when: check whether key request is pending/completed and whether a scoped key exists.
+- Do not use when: you only need portal instructions with no scope context.
+- Mode: Read-only.
+- Risk: Low.
+- Required permissions: none.
+- Prerequisites: scope selection.
+- Environment behavior: combines scoped Postgres request record and Vault key presence check.
+- Parameters: scope.
+- Response shape: `{scope,keyConfigured,vaultPath,request,recommendedNextSteps}`.
+- Common failures: Postgres/Vault read failures.
+- Follow-up: `weather_openweather_key_request_create`, `weather_api_key_upsert`, weather data tools.
+- Example:
+```json
+{"name":"weather_openweather_key_request_status","arguments":{"tenantId":"acme","userId":"sam"}}
+```
+
 ## weather_api_key_upsert / weather_api_key_delete
 - Use when: create/rotate/remove scoped API keys.
 - Do not use when: weather reads can use existing key.

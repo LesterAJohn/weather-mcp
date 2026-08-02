@@ -63,20 +63,26 @@ function createServiceClientMock() {
 }
 
 function createConfigStoreMock() {
+  const records = new Map();
   return {
     async healthcheck() {
       return { ok: true };
     },
     async listConfigs() {
-      return [{ key: "weather.defaults.units", value: "metric" }];
+      return Array.from(records.entries()).map(([key, value]) => ({ key, value }));
     },
     async getConfig(key) {
-      return { key, value: "metric" };
+      if (!records.has(key)) {
+        return null;
+      }
+      return { key, value: records.get(key) };
     },
     async setConfig(key, value) {
+      records.set(key, value);
       return { key, value };
     },
     async deleteConfig() {
+      records.clear();
       return true;
     }
   };
@@ -226,6 +232,61 @@ test("weather_http_token_create and revoke mutate token index", async () => {
 
     assert.equal(revoked.payload.ok, true);
     assert.equal(revoked.payload.data.revoked, true);
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("weather_openweather_key_request_create requires authorizationKey when admin key is configured", async () => {
+  const restoreEnv = setEnv({ MCP_ADMIN_AUTH_KEY: "super-secret" });
+
+  try {
+    const { server } = createServer();
+    const unauthorized = await invokeTool(server, "weather_openweather_key_request_create", {
+      tenantId: "acme",
+      userId: "sam",
+      reason: "onboard new integration"
+    });
+
+    assert.equal(unauthorized.result.isError, true);
+    assert.equal(unauthorized.payload.status, 401);
+
+    const authorized = await invokeTool(server, "weather_openweather_key_request_create", {
+      tenantId: "acme",
+      userId: "sam",
+      reason: "onboard new integration",
+      authorizationKey: "super-secret"
+    });
+
+    assert.equal(authorized.payload.ok, true);
+    assert.equal(authorized.payload.data.key, "openweather.keyRequest");
+    assert.equal(authorized.payload.data.request.status, "pending");
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("weather_openweather_key_request_status returns scoped request state and readiness", async () => {
+  const restoreEnv = setEnv({ MCP_ADMIN_AUTH_KEY: "" });
+
+  try {
+    const { server } = createServer();
+
+    await invokeTool(server, "weather_openweather_key_request_create", {
+      tenantId: "acme",
+      userId: "sam",
+      reason: "need key for weather timeline"
+    });
+
+    const status = await invokeTool(server, "weather_openweather_key_request_status", {
+      tenantId: "acme",
+      userId: "sam"
+    });
+
+    assert.equal(status.payload.ok, true);
+    assert.equal(typeof status.payload.data.keyConfigured, "boolean");
+    assert.equal(status.payload.data.request.status, "pending");
+    assert.equal(Array.isArray(status.payload.data.recommendedNextSteps), true);
   } finally {
     restoreEnv();
   }

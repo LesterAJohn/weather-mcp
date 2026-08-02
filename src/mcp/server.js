@@ -19,9 +19,12 @@ const MUTATING_TOOLS = new Set([
   "weather_api_key_delete",
   "weather_config_set",
   "weather_config_delete",
+  "weather_openweather_key_request_create",
   "weather_http_token_create",
   "weather_http_token_revoke"
 ]);
+
+const OPENWEATHER_KEY_REQUEST_CONFIG_KEY = "openweather.keyRequest";
 
 const ScopeSchema = {
   tenantId: z.string().min(1).optional(),
@@ -89,6 +92,36 @@ const TOOL_CATALOG = [
     failureModes: ["401 unauthorized admin key", "Vault write errors"],
     followUp: ["weather_api_key_status", "weather_current"],
     example: { name: "weather_api_key_upsert", arguments: { tenantId: "acme", userId: "sam", apiKey: "owm_...", authorizationKey: "<admin>" } }
+  },
+  {
+    name: "weather_openweather_key_request_create",
+    useWhen: "Submit or refresh a scoped request ticket for obtaining an OpenWeather API key from the website.",
+    avoidWhen: "A valid scoped key is already configured in Vault.",
+    category: "mutating",
+    risk: "medium",
+    permissions: "Requires authorizationKey when MCP_ADMIN_AUTH_KEY is configured.",
+    prerequisites: "Resolved tenant/principal scope and operational key request process.",
+    environmentSelection: "Stores request metadata in Postgres scoped config key openweather.keyRequest.",
+    params: ["tenantId?", "userId?", "accountId?", "requester?", "reason?", "authorizationKey?"],
+    response: "request metadata plus OpenWeather key portal URLs",
+    failureModes: ["401 unauthorized admin key", "database write failures"],
+    followUp: ["weather_openweather_key_request_status", "weather_api_key_upsert"],
+    example: { name: "weather_openweather_key_request_create", arguments: { tenantId: "acme", userId: "sam", reason: "new tenant onboarding" } }
+  },
+  {
+    name: "weather_openweather_key_request_status",
+    useWhen: "Check scoped key-request status and whether an API key is already configured.",
+    avoidWhen: "You only need weather data and key already exists.",
+    category: "read-only",
+    risk: "low",
+    permissions: "No special permissions",
+    prerequisites: "Resolved tenant/principal scope.",
+    environmentSelection: "Reads Postgres request metadata and scoped Vault key status.",
+    params: ["tenantId?", "userId?", "accountId?"],
+    response: "scope + keyConfigured + request record + recommendedNextSteps",
+    failureModes: ["Vault/Postgres read failures"],
+    followUp: ["weather_openweather_key_request_create", "weather_api_key_upsert", "weather_current"],
+    example: { name: "weather_openweather_key_request_status", arguments: { tenantId: "acme", userId: "sam" } }
   }
 ];
 
@@ -219,6 +252,7 @@ export function createMcpServer({
       const wantsConfig = op === "config" || text.includes("config");
       const wantsToken = op === "token" || text.includes("token");
       const wantsKey = op === "key_management" || text.includes("api key") || text.includes("apikey");
+      const wantsKeyRequest = text.includes("request key") || text.includes("get key") || text.includes("obtain key");
 
       const recommendedOrder = [
         { tool: "weather_connection_info", reason: "Validate runtime posture and scope model." },
@@ -233,6 +267,9 @@ export function createMcpServer({
         recommendedOrder.push({ tool: "weather_config_list", reason: "Inspect existing scoped configuration before mutation." });
       } else if (wantsToken) {
         recommendedOrder.push({ tool: "weather_http_token_create", reason: "Create tenant/principal scoped HTTP token entry in Vault." });
+      } else if (wantsKeyRequest) {
+        recommendedOrder.push({ tool: "weather_openweather_key_request_create", reason: "Track a scoped key request workflow before key ingestion." });
+        recommendedOrder.push({ tool: "weather_openweather_key_request_status", reason: "Verify pending/completed request state and readiness." });
       } else if (wantsKey) {
         recommendedOrder.push({ tool: "weather_api_key_upsert", reason: "Set scoped OpenWeather API key in Vault for multi-tenant calls." });
       } else {
@@ -252,6 +289,7 @@ export function createMcpServer({
           recommendedOrder,
           safetyChecks: [
             "Use weather_scope_info to confirm tenant/principal resolution before scoped updates.",
+            "Use weather_openweather_key_request_create to track website key acquisition before storing keys.",
             "Apply weather_api_key_upsert prior to weather reads if the scoped key is missing.",
             "Treat weather_config_set and weather_http_token_* as mutating operations.",
             "For mutating tools, provide authorizationKey when MCP_ADMIN_AUTH_KEY is configured.",
@@ -489,6 +527,83 @@ export function createMcpServer({
         ok: true,
         status: 200,
         data: { deleted: await configStore.deleteConfig(key, scope) }
+      };
+    })
+  );
+
+  server.tool(
+    "weather_openweather_key_request_create",
+    "Mutating: create or refresh a scoped OpenWeather key request workflow record.",
+    {
+      requester: z.string().min(1).optional(),
+      reason: z.string().min(1).optional(),
+      authorizationKey: z.string().min(1).optional(),
+      ...ScopeSchema
+    },
+    withErrorHandling(async ({ requester, reason, authorizationKey, tenantId, userId, accountId }) => {
+      assertAuthorized(authorizationKey, "weather_openweather_key_request_create");
+      const scope = normalizeScope({ tenantId, userId, accountId }, scopeDefaults);
+      const existing = await configStore.getConfig(OPENWEATHER_KEY_REQUEST_CONFIG_KEY, scope);
+      const now = new Date().toISOString();
+      const requestRecord = {
+        status: "pending",
+        provider: "openweather",
+        requester: requester ?? null,
+        reason: reason ?? null,
+        requestedAt: now,
+        updatedAt: now,
+        previousStatus: existing?.value?.status ?? null,
+        urls: {
+          signup: "https://home.openweathermap.org/users/sign_up",
+          apiKeys: "https://home.openweathermap.org/api_keys",
+          pricing: "https://openweathermap.org/price#onecall"
+        }
+      };
+
+      await configStore.setConfig(OPENWEATHER_KEY_REQUEST_CONFIG_KEY, requestRecord, scope);
+
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          scope,
+          key: OPENWEATHER_KEY_REQUEST_CONFIG_KEY,
+          request: requestRecord,
+          nextStep: "Create/retrieve API key from OpenWeather portal, then call weather_api_key_upsert."
+        }
+      };
+    })
+  );
+
+  server.tool(
+    "weather_openweather_key_request_status",
+    "Read-only: get scoped OpenWeather key-request workflow state and key readiness.",
+    {
+      ...ScopeSchema
+    },
+    withErrorHandling(async ({ tenantId, userId, accountId }) => {
+      const scope = normalizeScope({ tenantId, userId, accountId }, scopeDefaults);
+      const keyRequest = await configStore.getConfig(OPENWEATHER_KEY_REQUEST_CONFIG_KEY, scope);
+      const vaultPath = `${getVaultTenantPrincipalTokenIndexPath(normalizedAppName, scope)}/openweather`;
+      const secret = await vaultService.getSecret(vaultPath).catch(() => null);
+      const keyConfigured = Boolean(secret?.apiKey);
+
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          scope,
+          keyConfigured,
+          vaultPath,
+          request: keyRequest?.value ?? null,
+          recommendedNextSteps: keyConfigured
+            ? ["Use weather_current or timeline tools with this scope."]
+            : [
+                "Use weather_openweather_key_request_create to track request workflow.",
+                "Obtain key from OpenWeather portal.",
+                "Store key with weather_api_key_upsert."
+              ]
+        }
       };
     })
   );
